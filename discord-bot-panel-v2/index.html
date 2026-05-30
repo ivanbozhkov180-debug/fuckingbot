@@ -122,7 +122,12 @@
     <div class="card-title">🎵 Музыка</div>
     <div class="field">
       <label>Голосовой канал</label>
-      <input type="text" id="channel-name" placeholder="General" />
+      <div style="display:flex; gap:8px;">
+        <select id="channel-name" style="flex:1; background:#0d0d0d; border:1px solid var(--border); border-radius:2px; color:var(--text); font-family:IBM Plex Mono,monospace; font-size:13px; padding:10px 14px; outline:none;">
+          <option value="">-- загрузи каналы --</option>
+        </select>
+        <button class="btn-primary" onclick="loadChannels()" style="padding:10px 14px; white-space:nowrap;">↻</button>
+      </div>
     </div>
     <div class="btn-row">
       <button class="btn-success" id="btn-play" onclick="playMusic()"><span class="btn-spinner"></span>▶ ВКЛЮЧИТЬ</button>
@@ -160,7 +165,15 @@
   <!-- Webhooks -->
   <div class="card">
     <div class="card-title">🔗 Вебхуки</div>
-    <div class="field"><label>Текстовый канал</label><input type="text" id="webhook-channel" placeholder="general" /></div>
+    <div class="field">
+      <label>Текстовый канал</label>
+      <div style="display:flex; gap:8px;">
+        <select id="webhook-channel" style="flex:1; background:#0d0d0d; border:1px solid var(--border); border-radius:2px; color:var(--text); font-family:IBM Plex Mono,monospace; font-size:13px; padding:10px 14px; outline:none;">
+          <option value="">-- загрузи каналы --</option>
+        </select>
+        <button class="btn-primary" onclick="loadChannels()" style="padding:10px 14px; white-space:nowrap;">↻</button>
+      </div>
+    </div>
     <div class="field"><label>Название вебхука</label><input type="text" id="webhook-name-input" placeholder="My Webhook" /></div>
     <div class="btn-row">
       <button class="btn-primary" id="btn-create-webhook" onclick="createWebhook()"><span class="btn-spinner"></span>+ СОЗДАТЬ</button>
@@ -250,7 +263,7 @@ async function giveRole() {
 async function playMusic() {
   const btn = document.getElementById('btn-play');
   const ch = document.getElementById('channel-name').value.trim();
-  if (!ch) { toast('Укажите канал', 'error'); return; }
+  if (!ch) { toast('Выбери голосовой канал (нажми ↻)', 'error'); return; }
   setLoading(btn, true);
   try {
     const d = await api('/play', 'POST', {channel: ch});
@@ -383,6 +396,36 @@ function copyText(text) {
   navigator.clipboard.writeText(text).then(() => toast('Скопировано!')).catch(() => {
     const el = document.createElement('textarea'); el.value = text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); toast('Скопировано!');
   });
+}
+
+async function loadChannels() {
+  try {
+    const d = await api('/channels', 'GET');
+    
+    // Fill voice channels
+    const voiceSel = document.getElementById('channel-name');
+    const curVoice = voiceSel.value;
+    voiceSel.innerHTML = '<option value="">-- выбери канал --</option>';
+    d.voice.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.name; opt.textContent = c.name;
+      if (c.name === curVoice) opt.selected = true;
+      voiceSel.appendChild(opt);
+    });
+
+    // Fill text channels
+    const textSel = document.getElementById('webhook-channel');
+    const curText = textSel.value;
+    textSel.innerHTML = '<option value="">-- выбери канал --</option>';
+    d.text.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.name; opt.textContent = c.name;
+      if (c.name === curText) opt.selected = true;
+      textSel.appendChild(opt);
+    });
+
+    toast('Каналы загружены!');
+  } catch(e) { toast('Ошибка загрузки каналов: ' + e.message, 'error'); }
 }
 
 loadSaved();
