@@ -394,6 +394,16 @@ def list_webhooks():
     return jsonify(result), 200
 
 
+@flask_app.route("/channels", methods=["GET"])
+def list_channels():
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return jsonify({"error": "Guild not found"}), 404
+    text_channels = [{"id": str(c.id), "name": c.name} for c in guild.channels if isinstance(c, discord.TextChannel)]
+    voice_channels = [{"id": str(c.id), "name": c.name} for c in guild.channels if isinstance(c, discord.VoiceChannel)]
+    return jsonify({"text": text_channels, "voice": voice_channels}), 200
+
+
 @flask_app.route("/status", methods=["GET"])
 def status():
     tracks = get_cloudinary_tracks()
