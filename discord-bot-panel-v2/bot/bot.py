@@ -2,6 +2,8 @@ import os
 import asyncio
 import glob
 import threading
+import tempfile
+import requests as req_lib
 from dotenv import load_dotenv
 
 import discord
@@ -11,11 +13,24 @@ from discord import app_commands
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID"))
 MUSIC_DIR = os.path.join(os.path.dirname(__file__), "music")
+os.makedirs(MUSIC_DIR, exist_ok=True)
+
+# ── Cloudinary config ──────────────────────────────────────────────────────────
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", "dzsvuxsqi"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
@@ -31,12 +46,11 @@ tree = bot.tree
 # Shared state
 voice_client: discord.VoiceClient | None = None
 is_playing = False
-music_files: list[str] = []
 current_track_index = 0
+cloudinary_tracks: list[dict] = []  # [{name, url, public_id}]
 
 
-def get_music_files() -> list[str]:
-    """Return sorted list of audio files from MUSIC_DIR."""
+def get_local_music_files() -> list[str]:
     patterns = ("*.mp3", "*.wav", "*.ogg", "*.flac", "*.m4a")
     files = []
     for pattern in patterns:
@@ -44,25 +58,61 @@ def get_music_files() -> list[str]:
     return sorted(files)
 
 
+def get_cloudinary_tracks() -> list[dict]:
+    """Fetch all audio tracks from Cloudinary folder 'bot_music'."""
+    try:
+        result = cloudinary.api.resources(
+            resource_type="video",  # Cloudinary uses 'video' for audio too
+            prefix="bot_music/",
+            max_results=100,
+            type="upload"
+        )
+        tracks = []
+        for r in result.get("resources", []):
+            tracks.append({
+                "public_id": r["public_id"],
+                "url": r["secure_url"],
+                "name": r["public_id"].replace("bot_music/", "").replace("_", " ")
+            })
+        return tracks
+    except Exception as e:
+        print(f"[cloudinary] Error fetching tracks: {e}")
+        return []
+
+
 async def play_next(guild: discord.Guild):
-    """Play the next track in the queue (loops forever)."""
-    global is_playing, current_track_index, voice_client
+    global is_playing, current_track_index, voice_client, cloudinary_tracks
 
     if not is_playing or voice_client is None or not voice_client.is_connected():
         return
 
-    files = get_music_files()
-    if not files:
-        print("[bot] No music files found in /music directory.")
+    # Refresh cloudinary tracks
+    tracks = get_cloudinary_tracks()
+    local = get_local_music_files()
+
+    if not tracks and not local:
+        print("[bot] No music files found.")
         is_playing = False
         return
 
-    track = files[current_track_index % len(files)]
-    current_track_index = (current_track_index + 1) % len(files)
+    if tracks:
+        track = tracks[current_track_index % len(tracks)]
+        current_track_index = (current_track_index + 1) % len(tracks)
+        print(f"[bot] Playing from Cloudinary: {track['name']}")
 
-    print(f"[bot] Playing: {os.path.basename(track)}")
+        # Download to temp file
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        r = req_lib.get(track["url"], stream=True)
+        for chunk in r.iter_content(chunk_size=8192):
+            tmp.write(chunk)
+        tmp.close()
+        track_path = tmp.name
+    else:
+        track_path = local[current_track_index % len(local)]
+        current_track_index = (current_track_index + 1) % len(local)
+        print(f"[bot] Playing local: {os.path.basename(track_path)}")
 
-    source = discord.FFmpegPCMAudio(track)
+    source = discord.FFmpegPCMAudio(track_path)
     source = discord.PCMVolumeTransformer(source, volume=0.5)
 
     def after_track(error):
@@ -91,11 +141,6 @@ async def play_cmd(interaction: discord.Interaction, channel: str):
     )
     if vc is None:
         await interaction.response.send_message(f"❌ Voice channel **{channel}** not found.", ephemeral=True)
-        return
-
-    files = get_music_files()
-    if not files:
-        await interaction.response.send_message("❌ No audio files found in `/music` folder.", ephemeral=True)
         return
 
     if voice_client and voice_client.is_connected():
@@ -128,16 +173,14 @@ async def stop_cmd(interaction: discord.Interaction):
 # ── Bot events ─────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    # Sync to specific guild first (instant), then globally
     try:
         guild = discord.Object(id=GUILD_ID)
         tree.copy_global_to(guild=guild)
         await tree.sync(guild=guild)
         print(f"[bot] Logged in as {bot.user} | Commands synced to guild {GUILD_ID}")
     except discord.Forbidden:
-        # Fallback to global sync if guild sync fails
         await tree.sync()
-        print(f"[bot] Logged in as {bot.user} | Commands synced globally (guild sync failed)")
+        print(f"[bot] Logged in as {bot.user} | Commands synced globally")
 
 
 # ── Flask routes ───────────────────────────────────────────────────────────────
@@ -155,24 +198,20 @@ def give_role():
         guild = bot.get_guild(int(guild_id))
         if guild is None:
             return {"error": f"Guild {guild_id} not found"}
-
         member = guild.get_member(int(user_id))
         if member is None:
             try:
                 member = await guild.fetch_member(int(user_id))
             except discord.NotFound:
                 return {"error": f"User {user_id} not found in guild"}
-
         role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
         if role is None:
             return {"error": f"Role '{role_name}' not found"}
-
         await member.add_roles(role)
         return {"success": True, "message": f"Role '{role.name}' given to {member.display_name}"}
 
     future = asyncio.run_coroutine_threadsafe(_give(), bot.loop)
     result = future.result(timeout=10)
-
     if "error" in result:
         return jsonify(result), 404
     return jsonify(result), 200
@@ -182,7 +221,6 @@ def give_role():
 def play_route():
     data = request.get_json(force=True)
     channel_name = data.get("channel")
-
     if not channel_name:
         return jsonify({"error": "channel is required"}), 400
 
@@ -192,7 +230,6 @@ def play_route():
 
     async def _play():
         global voice_client, is_playing, current_track_index
-
         vc = discord.utils.find(
             lambda c: isinstance(c, discord.VoiceChannel) and c.name.lower() == channel_name.lower(),
             guild.channels,
@@ -200,9 +237,10 @@ def play_route():
         if vc is None:
             return {"error": f"Channel '{channel_name}' not found"}
 
-        files = get_music_files()
-        if not files:
-            return {"error": "No audio files in /music folder"}
+        tracks = get_cloudinary_tracks()
+        local = get_local_music_files()
+        if not tracks and not local:
+            return {"error": "No audio files found"}
 
         if voice_client and voice_client.is_connected():
             await voice_client.move_to(vc)
@@ -212,11 +250,10 @@ def play_route():
         is_playing = True
         current_track_index = 0
         await play_next(guild)
-        return {"success": True, "message": f"Playing in '{vc.name}'", "tracks": len(files)}
+        return {"success": True, "message": f"Playing in '{vc.name}'", "tracks": len(tracks) + len(local)}
 
     future = asyncio.run_coroutine_threadsafe(_play(), bot.loop)
-    result = future.result(timeout=10)
-
+    result = future.result(timeout=15)
     if "error" in result:
         return jsonify(result), 404
     return jsonify(result), 200
@@ -224,8 +261,6 @@ def play_route():
 
 @flask_app.route("/stop", methods=["POST"])
 def stop_route():
-    global voice_client, is_playing
-
     async def _stop():
         global voice_client, is_playing
         is_playing = False
@@ -239,10 +274,59 @@ def stop_route():
 
     future = asyncio.run_coroutine_threadsafe(_stop(), bot.loop)
     result = future.result(timeout=10)
-
     if "error" in result:
         return jsonify(result), 400
     return jsonify(result), 200
+
+
+@flask_app.route("/upload-track", methods=["POST"])
+def upload_track():
+    """Upload audio file to Cloudinary."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    track_name = request.form.get("name", file.filename.rsplit(".", 1)[0])
+    # Sanitize name for public_id
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in track_name)
+
+    try:
+        result = cloudinary.uploader.upload(
+            file,
+            resource_type="video",
+            folder="bot_music",
+            public_id=safe_name,
+            overwrite=True,
+            use_filename=False
+        )
+        return jsonify({
+            "success": True,
+            "message": f"Track '{track_name}' uploaded!",
+            "url": result["secure_url"],
+            "public_id": result["public_id"]
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/tracks", methods=["GET"])
+def list_tracks():
+    tracks = get_cloudinary_tracks()
+    local = [{"name": os.path.basename(f), "url": None, "public_id": None} for f in get_local_music_files()]
+    return jsonify({"tracks": tracks, "local": local, "total": len(tracks) + len(local)}), 200
+
+
+@flask_app.route("/delete-track", methods=["POST"])
+def delete_track():
+    data = request.get_json(force=True)
+    public_id = data.get("public_id")
+    if not public_id:
+        return jsonify({"error": "public_id is required"}), 400
+    try:
+        cloudinary.uploader.destroy(public_id, resource_type="video")
+        return jsonify({"success": True, "message": "Track deleted"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @flask_app.route("/create-webhook", methods=["POST"])
@@ -259,29 +343,20 @@ def create_webhook():
         guild = bot.get_guild(int(guild_id))
         if guild is None:
             return {"error": f"Guild {guild_id} not found"}
-
         channel = discord.utils.find(
             lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == channel_name.lower(),
             guild.channels,
         )
         if channel is None:
             return {"error": f"Text channel '{channel_name}' not found"}
-
         try:
             webhook = await channel.create_webhook(name=webhook_name)
-            return {
-                "success": True,
-                "webhook_url": webhook.url,
-                "webhook_name": webhook.name,
-                "channel": channel.name,
-                "message": f"Webhook '{webhook.name}' created in #{channel.name}"
-            }
+            return {"success": True, "webhook_url": webhook.url, "webhook_name": webhook.name, "channel": channel.name, "message": f"Webhook '{webhook.name}' created in #{channel.name}"}
         except discord.Forbidden:
             return {"error": "Bot doesn't have Manage Webhooks permission"}
 
     future = asyncio.run_coroutine_threadsafe(_create(), bot.loop)
     result = future.result(timeout=10)
-
     if "error" in result:
         return jsonify(result), 400
     return jsonify(result), 200
@@ -300,26 +375,20 @@ def list_webhooks():
         guild = bot.get_guild(int(guild_id))
         if guild is None:
             return {"error": f"Guild {guild_id} not found"}
-
         channel = discord.utils.find(
             lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == channel_name.lower(),
             guild.channels,
         )
         if channel is None:
             return {"error": f"Text channel '{channel_name}' not found"}
-
         try:
             webhooks = await channel.webhooks()
-            return {
-                "success": True,
-                "webhooks": [{"name": w.name, "url": w.url, "id": str(w.id)} for w in webhooks]
-            }
+            return {"success": True, "webhooks": [{"name": w.name, "url": w.url, "id": str(w.id)} for w in webhooks]}
         except discord.Forbidden:
             return {"error": "Bot doesn't have Manage Webhooks permission"}
 
     future = asyncio.run_coroutine_threadsafe(_list(), bot.loop)
     result = future.result(timeout=10)
-
     if "error" in result:
         return jsonify(result), 400
     return jsonify(result), 200
@@ -327,11 +396,14 @@ def list_webhooks():
 
 @flask_app.route("/status", methods=["GET"])
 def status():
+    tracks = get_cloudinary_tracks()
+    local = get_local_music_files()
     return jsonify({
         "bot_ready": bot.is_ready(),
         "is_playing": is_playing,
         "in_voice": voice_client is not None and voice_client.is_connected() if voice_client else False,
-        "music_files": len(get_music_files()),
+        "music_files": len(tracks) + len(local),
+        "cloudinary_tracks": len(tracks),
     })
 
 
@@ -341,10 +413,7 @@ def run_flask():
 
 
 if __name__ == "__main__":
-    # Start Flask in a background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("[flask] API server running on http://0.0.0.0:5000")
-
-    # Run Discord bot (blocking)
     bot.run(TOKEN)
