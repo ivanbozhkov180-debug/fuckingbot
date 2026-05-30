@@ -396,12 +396,22 @@ def list_webhooks():
 
 @flask_app.route("/channels", methods=["GET"])
 def list_channels():
-    guild = bot.get_guild(GUILD_ID)
-    if guild is None:
-        return jsonify({"error": "Guild not found"}), 404
-    text_channels = [{"id": str(c.id), "name": c.name} for c in guild.channels if isinstance(c, discord.TextChannel)]
-    voice_channels = [{"id": str(c.id), "name": c.name} for c in guild.channels if isinstance(c, discord.VoiceChannel)]
-    return jsonify({"text": text_channels, "voice": voice_channels}), 200
+    async def _fetch():
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None:
+            try:
+                guild = await bot.fetch_guild(GUILD_ID)
+                await guild.fetch_channels()
+            except Exception as e:
+                return {"error": str(e)}
+        text_channels = [{"id": str(c.id), "name": c.name} for c in guild.channels if isinstance(c, discord.TextChannel)]
+        voice_channels = [{"id": str(c.id), "name": c.name} for c in guild.channels if isinstance(c, discord.VoiceChannel)]
+        return {"text": text_channels, "voice": voice_channels}
+    future = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop)
+    result = future.result(timeout=10)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result), 200
 
 
 @flask_app.route("/status", methods=["GET"])
